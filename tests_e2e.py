@@ -501,6 +501,241 @@ r = client.get(f"/api/measurements/{m_g7}").json()
 check("当前 m_g7 无效", r["measurement"]["valid"] is False)
 
 print()
+print("== 场景 8：器具跃变（drift）查询 ==")
+reset_db()
+
+# STD-D 根证书 -> D 器具两张不重叠证书 C1[01-01,04-01)、C2[04-01,10-01)
+r = mkcert(0, "STD-D", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2027-01-01T00:00:00Z", 0.0, 0.5, root=True)
+DR = r.json()["certificate"]["id"]
+r = mkcert(1, "D", "2026-01-05T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2026-04-01T00:00:00Z", 0.0, 0.2, parent=DR)
+DC1 = r.json()["certificate"]["id"]
+r = mkcert(2, "D", "2026-04-02T00:00:00Z", "2026-04-01T00:00:00Z",
+           "2026-10-01T00:00:00Z", 0.0, 0.2, parent=DR)
+DC2 = r.json()["certificate"]["id"]
+
+# C1 下两条：差 0.25（阈值 0.5 不告警）
+r = post_meas(3, "2026-02-01T08:00:00Z", inst="D", value=1.0, cert_id=DC1)
+d1 = r.json()["measurement"]["id"]
+r = post_meas(4, "2026-02-10T08:00:00Z", inst="D", value=1.25, cert_id=DC1)
+d2 = r.json()["measurement"]["id"]
+# C2 下三条：0.75 告警、再 0.75 告警（告警后仍继续相邻比较）
+r = post_meas(5, "2026-04-10T08:00:00Z", inst="D", value=1.0, cert_id=DC2)
+d3 = r.json()["measurement"]["id"]
+r = post_meas(6, "2026-05-10T08:00:00Z", inst="D", value=1.75, cert_id=DC2)
+d4 = r.json()["measurement"]["id"]
+r = post_meas(7, "2026-05-20T08:00:00Z", inst="D", value=2.5, cert_id=DC2)
+d5 = r.json()["measurement"]["id"]
+rev_before_d_revoke = rev()  # 8
+
+W = {"start": "2026-01-01T00:00:00Z", "end": "2027-01-01T00:00:00Z",
+     "max_delta": "0.5"}
+
+r = client.get("/api/instruments/D/drift", params=W)
+check("drift 200", r.status_code == 200, r.text)
+dj = r.json()
+check("drift 回显参数", dj["revision"] == 8 and dj["instrument_id"] == "D"
+      and dj["max_delta"] == 0.5 and dj["measurement_count"] == 5, str(dj))
+check("drift 比较次数=3（C1 内 1 次 + C2 内 2 次；证书切换不比较）",
+      dj["comparison_count"] == 3, str(dj["comparison_count"]))
+check("drift 告警为 d3->d4 与 d4->d5",
+      [(x["previous_measurement_id"], x["measurement_id"]) for x in dj["drifts"]]
+      == [(d3, d4), (d4, d5)], str(dj["drifts"]))
+check("drift 差值带方向与绝对值",
+      all(x["delta"] == 0.75 and x["abs_delta"] == 0.75 for x in dj["drifts"]),
+      str(dj["drifts"]))
+
+# 严格大于阈值：恰好等于 0.5 不告警
+r = client.get("/api/instruments/D/drift",
+               params={**W, "max_delta": "0.75"})
+dj2 = r.json()
+check("等于阈值不告警（严格大于）", dj2["comparison_count"] == 3
+      and dj2["drifts"] == [], str(dj2))
+
+# max_delta=0 合法：任意有差异的相邻对都告警
+r = client.get("/api/instruments/D/drift", params={**W, "max_delta": "0"})
+check("max_delta=0 合法且全部有差相邻对告警",
+      r.status_code == 200 and len(r.json()["drifts"]) == 3, r.text)
+
+# 半开窗口边界：起点含、终点不含
+r = client.get("/api/instruments/D/drift", params={
+    "start": "2026-02-01T08:00:00Z", "end": "2026-04-10T08:00:00Z",
+    "max_delta": "0.5"})
+dj3 = r.json()
+check("半开窗口 [02-01,04-10) 仅含 d1、d2（d3 落在终点被排除）",
+      dj3["measurement_count"] == 2 and dj3["comparison_count"] == 1
+      and dj3["drifts"] == [], str(dj3))
+
+# 空窗口 / 不存在器具：零比较、空告警
+r = client.get("/api/instruments/D/drift", params={
+    "start": "2030-01-01T00:00:00Z", "end": "2031-01-01T00:00:00Z",
+    "max_delta": "0.5"})
+check("无测量窗口零比较空告警", r.status_code == 200
+      and r.json()["measurement_count"] == 0
+      and r.json()["comparison_count"] == 0
+      and r.json()["drifts"] == [], r.text)
+r = client.get("/api/instruments/NOPE/drift", params=W)
+check("不存在器具零比较空告警（不返回 404）", r.status_code == 200
+      and r.json()["comparison_count"] == 0 and r.json()["drifts"] == [], r.text)
+# 仅一条有效测量：零比较
+r = client.get("/api/instruments/D/drift", params={
+    "start": "2026-02-01T08:00:00Z", "end": "2026-02-02T00:00:00Z",
+    "max_delta": "0.5"})
+check("单条测量零比较", r.json()["comparison_count"] == 0
+      and r.json()["measurement_count"] == 1, r.text)
+
+# 参数校验：start >= end -> 422；阈值非法 -> 422
+r = client.get("/api/instruments/D/drift", params={
+    "start": "2026-05-01T00:00:00Z", "end": "2026-05-01T00:00:00Z",
+    "max_delta": "0.5"})
+check("start==end -> 422 invalid_time_window",
+      expect_error(r, 422, "invalid_time_window"), r.text)
+r = client.get("/api/instruments/D/drift", params={
+    "start": "2026-06-01T00:00:00Z", "end": "2026-05-01T00:00:00Z",
+    "max_delta": "0.5"})
+check("start>end -> 422 invalid_time_window",
+      expect_error(r, 422, "invalid_time_window"), r.text)
+r = client.get("/api/instruments/D/drift", params={**W, "max_delta": "-0.1"})
+check("负阈值 -> 422 invalid_max_delta",
+      expect_error(r, 422, "invalid_max_delta"), r.text)
+r = client.get("/api/instruments/D/drift", params={**W, "max_delta": "nan"})
+check("NaN 阈值 -> 422 invalid_max_delta",
+      expect_error(r, 422, "invalid_max_delta"), r.text)
+r = client.get("/api/instruments/D/drift", params={**W, "max_delta": "inf"})
+check("无穷阈值 -> 422 invalid_max_delta",
+      expect_error(r, 422, "invalid_max_delta"), r.text)
+r = client.get("/api/instruments/D/drift", params={
+    "start": "not-a-date", "end": "2027-01-01T00:00:00Z",
+    "max_delta": "0.5"})
+check("非法时间格式 -> 422（FastAPI 标准）", r.status_code == 422, r.text)
+r = client.get("/api/instruments/D/drift", params={**W, "max_delta": "abc"})
+check("非数值阈值 -> 422（FastAPI 标准）", r.status_code == 422, r.text)
+r = client.get("/api/instruments/D/drift", params={
+    "start": W["start"], "end": W["end"], "max_delta": "0.5",
+    "revision": -1})
+check("负 revision -> 422（FastAPI 标准）", r.status_code == 422, r.text)
+
+# 未来修订 -> 404
+r = client.get("/api/instruments/D/drift", params={**W, "revision": 9999})
+check("未来修订 drift -> 404 revision_not_found",
+      r.status_code == 404 and r.json()["detail"]["error"] == "revision_not_found",
+      r.text)
+
+# 只读：不推进修订号
+before = rev()
+client.get("/api/instruments/D/drift", params=W)
+client.get("/api/instruments/D/drift", params={**W, "revision": 0})
+check("drift 只读不推进修订", rev() == before)
+
+# 撤销 DC1 于 02-05：d1(02-01) 仍有效、d2(02-10) 失效；
+# 撤销 DC2 于 05-15：d4(05-10) 仍有效、d5(05-20) 失效
+r = client.post(f"/api/certificates/{DC1}/revoke", json={
+    "expected_revision": 8, "revoked_at": "2026-02-05T00:00:00Z"})
+check("撤销 DC1 成功", r.status_code == 200, r.text)
+r = client.post(f"/api/certificates/{DC2}/revoke", json={
+    "expected_revision": 9, "revoked_at": "2026-05-15T00:00:00Z"})
+check("撤销 DC2 成功", r.status_code == 200, r.text)
+
+r = client.get("/api/instruments/D/drift", params=W)
+dj = r.json()
+check("撤销后重算：5 条记录、仅 1 次比较（d3-d4 同证书有效；d1/d2 间夹失效、d4/d5 间夹失效）",
+      dj["revision"] == 10 and dj["measurement_count"] == 5
+      and dj["comparison_count"] == 1, str(dj))
+check("撤销后仅 d3->d4 告警（d4-d5 不跨无效 d5 拼接）",
+      [(x["previous_measurement_id"], x["measurement_id"]) for x in dj["drifts"]]
+      == [(d3, d4)], str(dj["drifts"]))
+
+# 无效记录不得跳过拼接：d2(有效)->d3(有效,不同证书且中间无无效) 本就因证书切换不比较；
+# 重点验证 d4(有效)->d5(无效)->（再登记一条 d6）：d4 与 d6 不得比较
+r = post_meas(10, "2026-06-01T08:00:00Z", inst="D", value=9.9, cert_id=DC2)
+check("DC2 撤销后区间登记被拒", r.status_code == 422, r.text)
+# d5 已是无效记录；序列 ... d4(有效), d5(无效) 结尾，验证 d4 不与后续跨 d5 拼接：
+# 无新证书可登记（DC2 已撤销），改用历史修订验证早期告警仍保留
+r = client.get("/api/instruments/D/drift",
+               params={**W, "revision": rev_before_d_revoke})
+dj = r.json()
+check("早期修订 8 重算保留当时两条告警",
+      dj["revision"] == 8 and dj["comparison_count"] == 3
+      and [(x["previous_measurement_id"], x["measurement_id"]) for x in dj["drifts"]]
+      == [(d3, d4), (d4, d5)], str(dj))
+# 撤销 DC1 后、撤销 DC2 前（rev=9）：d2 已失效（C1 内零比较），C2 两条告警不变
+r = client.get("/api/instruments/D/drift", params={**W, "revision": 9})
+dj = r.json()
+check("rev=9（DC1 已撤销、DC2 未撤销）C2 告警仍为两条，共 2 次比较",
+      dj["revision"] == 9 and len(dj["drifts"]) == 2
+      and dj["comparison_count"] == 2, str(dj))
+# rev=10：d2、d5 失效，两侧有效记录均不跨无效拼接，仅 d3-d4 比较
+r = client.get("/api/instruments/D/drift", params={**W, "revision": 10})
+dj = r.json()
+check("rev=10 比较次数 1，仅 d3->d4 告警",
+      dj["revision"] == 10 and dj["comparison_count"] == 1
+      and [(x["previous_measurement_id"], x["measurement_id"]) for x in dj["drifts"]]
+      == [(d3, d4)], str(dj))
+
+# 无效测量夹在两条同证书有效测量之间：构造新器具 E 验证“不拼接”
+r = mkcert(10, "STD-E", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2027-01-01T00:00:00Z", 0.0, 0.5, root=True)
+ER = r.json()["certificate"]["id"]
+r = mkcert(11, "E", "2026-01-05T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2026-12-01T00:00:00Z", 0.0, 0.2, parent=ER)
+EC = r.json()["certificate"]["id"]
+r = post_meas(12, "2026-02-01T00:00:00Z", inst="E", value=1.0, cert_id=EC)
+e1 = r.json()["measurement"]["id"]
+r = post_meas(13, "2026-03-01T00:00:00Z", inst="E", value=5.0, cert_id=EC)
+e2 = r.json()["measurement"]["id"]
+r = post_meas(14, "2026-04-01T00:00:00Z", inst="E", value=1.2, cert_id=EC)
+e3 = r.json()["measurement"]["id"]
+# 撤销 EC 于 03-15：e1(02-01)、e2(03-01) 仍有效，e3(04-01) 无效
+r = client.post(f"/api/certificates/{EC}/revoke", json={
+    "expected_revision": 15, "revoked_at": "2026-03-15T00:00:00Z"})
+check("撤销 EC 成功", r.status_code == 200, r.text)
+r = client.get("/api/instruments/E/drift", params={
+    "start": "2026-01-01T00:00:00Z", "end": "2027-01-01T00:00:00Z",
+    "max_delta": "0.5"})
+dj = r.json()
+check("无效 e3 不参与且不拼接：e1-e2 比较 1 次，e2 不与 e3 比",
+      dj["measurement_count"] == 3 and dj["comparison_count"] == 1
+      and len(dj["drifts"]) == 1, str(dj))
+check("E 场景告警内容 e1->e2 delta=4.0",
+      [(x["previous_measurement_id"], x["measurement_id"]) for x in dj["drifts"]]
+      == [(e1, e2)] and dj["drifts"][0]["delta"] == 4.0
+      and dj["drifts"][0]["abs_delta"] == 4.0, str(dj))
+
+# 同一时刻按 id 排序的稳定性（E 器具撤销前 rev=14 不可再登记，用新器具 F）
+r = mkcert(16, "STD-F", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2027-01-01T00:00:00Z", 0.0, 0.5, root=True)
+FR = r.json()["certificate"]["id"]
+r = mkcert(17, "F", "2026-01-05T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2026-12-01T00:00:00Z", 0.0, 0.2, parent=FR)
+FC = r.json()["certificate"]["id"]
+r = post_meas(18, "2026-03-01T00:00:00Z", inst="F", value=1.0, cert_id=FC)
+f1 = r.json()["measurement"]["id"]
+r = post_meas(19, "2026-03-01T00:00:00Z", inst="F", value=3.0, cert_id=FC)
+f2 = r.json()["measurement"]["id"]
+r = client.get("/api/instruments/F/drift", params={
+    "start": "2026-01-01T00:00:00Z", "end": "2027-01-01T00:00:00Z",
+    "max_delta": "0.5"})
+dj = r.json()
+check("同一时刻按 id 排序：f1->f2 产生告警",
+      dj["comparison_count"] == 1
+      and [(x["previous_measurement_id"], x["measurement_id"]) for x in dj["drifts"]]
+      == [(f1, f2)] and dj["drifts"][0]["delta"] == 2.0, str(dj))
+
+# 半开修订可见性：created_revision > 目标修订的测量不参与
+r = client.get("/api/instruments/F/drift", params={
+    "start": "2026-01-01T00:00:00Z", "end": "2027-01-01T00:00:00Z",
+    "max_delta": "0.5", "revision": 19})
+check("按修订 19 查询：f2 尚未创建，仅 f1 零比较",
+      r.json()["measurement_count"] == 1 and r.json()["comparison_count"] == 0
+      and r.json()["drifts"] == [], r.text)
+
+# 其他器具查询不串数据
+r = client.get("/api/instruments/D/drift", params={**W, "revision": 8})
+check("D 器具结果不含 E/F 数据",
+      r.json()["measurement_count"] == 5, str(r.json()))
+
+print()
 print(f"==== 结果：{PASS} 通过，{FAIL} 失败 ====")
 import sys
 sys.exit(1 if FAIL else 0)

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import db, domain
 from .domain import (
     iso,
+    compute_drift,
     load_cert_chain,
     serialize_cert,
     serialize_measurement,
@@ -718,4 +719,80 @@ def get_measurement(
     return {
         "revision": rev,
         "measurement": serialize_measurement(meas, rev, cert, chain),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 跃变（drift）查询（只读，支持按历史修订查询）
+# ---------------------------------------------------------------------------
+@app.get("/api/instruments/{instrument_id}/drift")
+def get_instrument_drift(
+    instrument_id: str,
+    start: datetime,
+    end: datetime,
+    max_delta: float,
+    revision: int | None = Query(default=None, ge=0),
+    conn=Depends(db.get_conn),
+):
+    """半开时间窗 [start, end) 内相邻有效测量的跃变检测。
+
+    - 仅统计 created_revision <= 目标修订、且发生在窗口内的测量；
+    - 无效测量与证书切换均重置比较基线，不跨无效记录拼接两侧；
+    - 只读接口：不推进修订号。
+    """
+    start_utc = utc(start)
+    end_utc = utc(end)
+
+    # 半开窗口要求 start < end
+    if not start_utc < end_utc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_time_window",
+                "message": "半开时间窗要求 start < end",
+                "start": iso(start_utc),
+                "end": iso(end_utc),
+            },
+        )
+
+    # 阈值必须为有限的非负数
+    if not math.isfinite(max_delta) or max_delta < 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_max_delta",
+                "message": "max_delta 必须为有限且非负的数值",
+            },
+        )
+
+    cur = current_revision(conn)
+    rev = cur if revision is None else revision
+    if rev > cur:
+        conn.rollback()
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "revision_not_found", "revision": rev},
+        )
+
+    rows = conn.execute(
+        """
+        SELECT * FROM measurement
+        WHERE instrument_id = %s
+          AND created_revision <= %s
+          AND %s <= measured_at AND measured_at < %s
+        ORDER BY measured_at, id
+        """,
+        (instrument_id, rev, start_utc, end_utc),
+    ).fetchall()
+
+    comparisons, drifts = compute_drift(rows, rev, max_delta)
+    conn.commit()
+    return {
+        "revision": rev,
+        "instrument_id": instrument_id,
+        "window": {"start": iso(start_utc), "end": iso(end_utc)},
+        "max_delta": max_delta,
+        "measurement_count": len(rows),
+        "comparison_count": comparisons,
+        "drifts": drifts,
     }

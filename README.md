@@ -11,6 +11,7 @@
 - 撤销响应列出本次转为无效的测量及其**失效因果链**：按每级子证书的**校准时刻**逐级向上追溯，仅保留对本次失效有因果贡献的环节——上级**晚撤销**（失效起点晚于下级校准时刻）不计入，链尾即**根因证书**（自身撤销或递归判废的最近一级）
 - 所有写请求携带 `expected_revision`，在单事务内原子推进**全局修订号**；过期返回 **409**
 - 查询接口支持 `?revision=N`，**任意历史修订下的测量结论均保留**
+- 只读跃变查询 `GET /api/instruments/{instrument_id}/drift`：在半开时间窗内对按（时刻、ID）排序的相邻**有效**测量做比较，绝对差**严格超过** `max_delta` 即告警；无效测量与证书切换都**重置比较基线**（不跳过无效记录拼接两侧），证书撤销后按目标修订重算，早期修订下的告警原样保留；读取**不推进修订号**
 
 ## 目录结构
 
@@ -19,11 +20,12 @@
 ├── app/
 │   ├── main.py        # FastAPI 路由、事务与级联重判逻辑
 │   ├── db.py          # 连接池与建表脚本（含排他约束）
-│   └── domain.py      # 按修订计算证书状态 / 失效区间 / 序列化
+│   └── domain.py      # 按修订计算证书状态 / 失效区间 / 跃变检测 / 序列化
 ├── scripts/
 │   ├── demo.py            # 基础流程演示（生成 README 样例）
-│   └── demo_recursive.py  # 递归失效演示
-├── tests_e2e.py       # 端到端业务规则测试（104 项断言）
+│   ├── demo_recursive.py  # 递归失效演示
+│   └── demo_drift.py      # 跃变查询演示（生成 README 样例）
+├── tests_e2e.py       # 端到端业务规则测试（139 项断言）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -86,6 +88,18 @@ curl -sX POST http://localhost:8000/api/certificates/2/revoke -H 'Content-Type: 
 curl -s 'http://localhost:8000/api/measurements/1?revision=4'
 ```
 
+跃变查询是只读接口，无需 `expected_revision`，例如：
+
+```bash
+# 时间窗 [2026-03-01, 2026-08-01)、阈值 0.01 的相邻有效测量跃变
+curl -sG 'http://localhost:8000/api/instruments/DMM-7788/drift' \
+  --data-urlencode 'start=2026-03-01T00:00:00Z' \
+  --data-urlencode 'end=2026-08-01T00:00:00Z' \
+  --data-urlencode 'max_delta=0.01'
+```
+
+完整的跃变查询样例（含证书切换重置、撤销重算与历史修订）见下文「10. 器具跃变（drift）查询」，也可直接运行 `python3 scripts/demo_drift.py` 复现。
+
 各步 `expected_revision` 需与当前全局修订号一致（可用 `curl -s http://localhost:8000/api/revision` 查询），过期返回 409。
 
 ### 本地非 Docker 运行（可选）
@@ -109,6 +123,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/measurements` | 登记测量（写；不传 `certificate_id` 则自动绑定） |
 | GET | `/api/measurements` | 测量结论列表，可按 `instrument_id`、`revision` 过滤 |
 | GET | `/api/measurements/{id}` | 单条测量在指定修订下的结论 |
+| GET | `/api/instruments/{instrument_id}/drift` | 时间窗内相邻有效测量的跃变查询（只读，可按 `revision` 查询） |
 
 写请求的时间字段均为 ISO 8601（建议带 `Z` 时区；不带时区按 UTC 处理）。
 
@@ -653,7 +668,241 @@ POST /api/certificates/1/revoke
 
 传播规则：子证书 2 的校准时刻 02-01 落入根证书失效区间 `[01-15, 明年01-01)`，故**整证失效**，其失效区间变为整条有效期 `[2026-02-01, 2026-12-01)`；孙证书 3 的校准时刻 03-01 又落入该区间，递归判废。若子证书校准时刻早于上级失效起点（如根 02-15 才撤销、子证书 02-01 校准），则子证书不判废、其子树也不传播。
 
-### 10. 其他常见错误（均为 HTTP 422，请求体结构问题为 FastAPI 标准 422）
+### 10. 器具跃变（drift）查询
+
+```
+GET /api/instruments/{instrument_id}/drift
+```
+
+查询参数（时间均为 ISO 8601，建议带 `Z`；不带时区按 UTC 处理）：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `start` | 是 | 半开时间窗起点（含） |
+| `end` | 是 | 半开时间窗终点（不含），要求 `start < end` |
+| `max_delta` | 是 | 跃变阈值，**有限且非负**；`|Δ|` 严格大于它才告警，故 `max_delta=0` 合法 |
+| `revision` | 否 | 目标修订；缺省为当前修订，未来修订返回 404 |
+
+判定规则：
+
+- 仅读取窗口内 `created_revision <= 目标修订` 的测量，按 `(measured_at, id)` 升序处理；
+- 相邻测量只有在**当前修订下都有效**（沿用历史有效性判定：`invalidated_revision` 为空或晚于目标修订）且**绑定同一张证书**时才产生一次比较——**证书切换重置基线**；
+- **无效测量也重置基线**：不会跳过无效记录后把两侧有效测量拼起来比较，以免把不可信间隔误报为跃变；
+- 每次比较后当前测量即成为新基线（连续跃变会连续告警）；`delta` 为后值减前值（带方向），另附 `abs_delta`；
+- 窗口内没有可比测量时 `comparison_count=0`、`drifts=[]`；接口为只读，**不推进修订号**，也不影响登记、撤销与历史查询。
+
+以下样例由 `scripts/demo_drift.py` 在空库上真实调用产生（id 从 1 开始）。器具 `DMM-D` 先后持有两张端点相接、互不重叠的证书 C1（id=2，`[2026-01-01, 2026-04-01)`）与 C2（id=3，`[2026-04-01, 2026-10-01)`），登记 5 条测量：
+
+| 测量 id | measured_at | value | 绑定证书 |
+| --- | --- | --- | --- |
+| 1 | 2026-02-01 08:00Z | 1.00 | C1(2) |
+| 2 | 2026-02-10 08:00Z | 1.25 | C1(2) |
+| 3 | 2026-04-10 08:00Z | 1.00 | C2(3) |
+| 4 | 2026-05-10 08:00Z | 1.75 | C2(3) |
+| 5 | 2026-05-20 08:00Z | 2.50 | C2(3) |
+
+#### 10.1 正常查询：证书切换不比较，阈值 0.5 命中 C2 上的两次跃变
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z&max_delta=0.5
+```
+（curl 写法：`curl -sG 'http://localhost:8000/api/instruments/DMM-D/drift' --data-urlencode 'start=2026-01-01T00:00:00Z' --data-urlencode 'end=2027-01-01T00:00:00Z' --data-urlencode 'max_delta=0.5'`）
+
+```json
+{
+  "revision": 8,
+  "instrument_id": "DMM-D",
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2027-01-01T00:00:00Z"
+  },
+  "max_delta": 0.5,
+  "measurement_count": 5,
+  "comparison_count": 3,
+  "drifts": [
+    {
+      "previous_measurement_id": 3,
+      "measurement_id": 4,
+      "delta": 0.75,
+      "abs_delta": 0.75
+    },
+    {
+      "previous_measurement_id": 4,
+      "measurement_id": 5,
+      "delta": 0.75,
+      "abs_delta": 0.75
+    }
+  ]
+}
+```
+
+`comparison_count=3`：C1 内 1→2（差 0.25，不告警）、C2 内 3→4 与 4→5（各差 0.75，告警）。测量 2→3 虽在时间上相邻，但跨越证书切换（C1→C2），**不比较**。
+
+阈值取 0.75 时，因要求绝对差**严格大于**阈值，两条恰好差 0.75 的相邻对都不再告警（比较次数仍为 3）：
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z&max_delta=0.75
+```
+```json
+{
+  "revision": 8,
+  "instrument_id": "DMM-D",
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2027-01-01T00:00:00Z"
+  },
+  "max_delta": 0.75,
+  "measurement_count": 5,
+  "comparison_count": 3,
+  "drifts": []
+}
+```
+
+#### 10.2 撤销后按当前修订重算：无效记录重置基线，不跨它拼接
+
+自 2026-02-05 撤销 C1（测量 2 于 02-10 落入失效区间而无效，测量 1 仍有效），再自 2026-05-15 撤销 C2（测量 5 无效，测量 4 在撤销时刻之前仍有效）：
+
+```
+POST /api/certificates/2/revoke   { "expected_revision": 8, "revoked_at": "2026-02-05T00:00:00Z" }
+POST /api/certificates/3/revoke   { "expected_revision": 9, "revoked_at": "2026-05-15T00:00:00Z" }
+```
+
+再次查询（当前修订 10）：5 条记录仍全部回显，但只剩 3→4 一次比较；测量 1 与无效的测量 2 不比较、测量 4 也**不会跳过**无效的测量 5 产生任何告警：
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z&max_delta=0.5
+```
+```json
+{
+  "revision": 10,
+  "instrument_id": "DMM-D",
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2027-01-01T00:00:00Z"
+  },
+  "max_delta": 0.5,
+  "measurement_count": 5,
+  "comparison_count": 1,
+  "drifts": [
+    {
+      "previous_measurement_id": 3,
+      "measurement_id": 4,
+      "delta": 0.75,
+      "abs_delta": 0.75
+    }
+  ]
+}
+```
+
+#### 10.3 按历史修订重算：撤销前的告警原样保留
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z&max_delta=0.5&revision=8
+```
+```json
+{
+  "revision": 8,
+  "instrument_id": "DMM-D",
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2027-01-01T00:00:00Z"
+  },
+  "max_delta": 0.5,
+  "measurement_count": 5,
+  "comparison_count": 3,
+  "drifts": [
+    {
+      "previous_measurement_id": 3,
+      "measurement_id": 4,
+      "delta": 0.75,
+      "abs_delta": 0.75
+    },
+    {
+      "previous_measurement_id": 4,
+      "measurement_id": 5,
+      "delta": 0.75,
+      "abs_delta": 0.75
+    }
+  ]
+}
+```
+
+#### 10.4 无可比测量：零比较、空告警
+
+窗口内没有任何测量（器具不存在时同理——器具本身不需要预先登记）：
+
+```
+GET /api/instruments/DMM-D/drift?start=2030-01-01T00:00:00Z&end=2031-01-01T00:00:00Z&max_delta=0.5
+```
+```json
+{
+  "revision": 10,
+  "instrument_id": "DMM-D",
+  "window": {
+    "start": "2030-01-01T00:00:00Z",
+    "end": "2031-01-01T00:00:00Z"
+  },
+  "max_delta": 0.5,
+  "measurement_count": 0,
+  "comparison_count": 0,
+  "drifts": []
+}
+```
+
+#### 10.5 参数错误与未来修订
+
+`start` 不早于 `end`：
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-06-01T00:00:00Z&end=2026-06-01T00:00:00Z&max_delta=0.5
+```
+```json
+{
+  "detail": {
+    "error": "invalid_time_window",
+    "message": "半开时间窗要求 start < end",
+    "start": "2026-06-01T00:00:00Z",
+    "end": "2026-06-01T00:00:00Z"
+  }
+}
+```
+
+阈值非法（负数、`nan`、`inf` 均返回 422）：
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z&max_delta=-0.1
+```
+```json
+{
+  "detail": {
+    "error": "invalid_max_delta",
+    "message": "max_delta 必须为有限且非负的数值"
+  }
+}
+```
+
+未来修订返回 404；时间格式错误、缺参数等请求结构问题返回 FastAPI 标准 422：
+
+```
+GET /api/instruments/DMM-D/drift?start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z&max_delta=0.5&revision=9999
+```
+```json
+{
+  "detail": {
+    "error": "revision_not_found",
+    "revision": 9999
+  }
+}
+```
+
+复现本组样例（空库启动服务后）：
+
+```bash
+docker compose down -v && docker compose up --build -d
+python3 scripts/demo_drift.py
+```
+
+### 11. 其他常见错误（均为 HTTP 422，请求体结构问题为 FastAPI 标准 422）
 
 | 场景 | `detail.error` |
 | --- | --- |
@@ -667,16 +916,20 @@ POST /api/certificates/1/revoke
 | 指定证书有效期不覆盖测量时刻 | `certificate_not_covering` |
 | 撤销时刻不在证书有效期内 | `revocation_outside_validity` |
 | 撤销已撤销 / 已判废证书 | `certificate_not_revocable` |
+| 跃变查询 `start >= end` | `invalid_time_window` |
+| 跃变查询 `max_delta` 为负 / NaN / 无穷 | `invalid_max_delta` |
+| 跃变查询（及其他查询）指向未来修订 | `revision_not_found`（**404**） |
 
 ## 并发性与一致性说明
 
 - 每个写请求是一个数据库事务：先对全局修订行 `SELECT ... FOR UPDATE` 加锁并比对 `expected_revision`，再做全部校验与写入，最后 `UPDATE revision SET value = value + 1` 提交。校验失败或约束冲突整体回滚，修订号不外溢。
 - 同一器具证书不重叠由 PostgreSQL 的 `EXCLUDE USING gist (instrument_id WITH =, tstzrange(...) WITH &&)` 约束兜底。
 - 历史结论不是快照表，而是由写入时刻（`created_revision`）、撤销时刻（`revoked_at` / `revoked_revision`）、判废修订（`invalidated_revision`）在查询时按目标修订推导，因此任意修订都能复现当时结论。
+- 跃变查询（`/api/instruments/{id}/drift`）与其他查询接口均为只读：单条连接内仅执行 `SELECT` 后提交，不触碰全局修订行、不推进修订号，也不改变登记、撤销与历史查询的任何结果。
 
 ## 运行测试
 
-端到端测试覆盖上述全部规则（半开区间边界、容差、重叠排他、自动/显式绑定、撤销截止边界、递归传播、混合传播、撤销因果追溯、409、历史修订），共 104 项断言：
+端到端测试覆盖上述全部规则（半开区间边界、容差、重叠排他、自动/显式绑定、撤销截止边界、递归传播、混合传播、撤销因果追溯、409、历史修订、跃变查询的比较计数/证书切换重置/无效记录不拼接/撤销重算/历史告警保留/422/404/只读），共 139 项断言：
 
 ```bash
 # 需要一个可连接的 PostgreSQL，并设置 DATABASE_URL
@@ -688,4 +941,5 @@ python3 tests_e2e.py
 ```bash
 python3 scripts/demo.py
 python3 scripts/demo_recursive.py
+python3 scripts/demo_drift.py
 ```

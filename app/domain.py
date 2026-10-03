@@ -114,6 +114,43 @@ def measurement_valid(meas: dict[str, Any], revision: int) -> bool:
     return inv is None or inv > revision
 
 
+def compute_drift(
+    measurements: list[dict[str, Any]], revision: int, max_delta: float
+) -> tuple[int, list[dict[str, Any]]]:
+    """对已按 (measured_at, id) 升序排列的测量做相邻比较，返回 (比较次数, 跃变告警)。
+
+    比较基线规则：
+    - 无效测量（沿用 measurement_valid 的历史有效性判定）不参与比较，
+      且重置基线——不得跳过它拼接两侧有效测量；
+    - 相邻有效测量绑定不同证书（证书切换）同样重置基线，仅同证书的
+      相邻有效测量产生一次比较；
+    - 每次比较后，当前有效测量即成为新的基线（即使本次触发了跃变告警）。
+
+    绝对差严格大于 max_delta 才告警，delta 为后值减前值（带方向）。
+    """
+    comparisons = 0
+    drifts: list[dict[str, Any]] = []
+    baseline: dict[str, Any] | None = None
+    for m in measurements:
+        if not measurement_valid(m, revision):
+            # 无效测量打断可比性：两侧不得跨它拼接
+            baseline = None
+            continue
+        if baseline is not None and m["certificate_id"] == baseline["certificate_id"]:
+            comparisons += 1
+            delta = m["value"] - baseline["value"]
+            if abs(delta) > max_delta:
+                drifts.append({
+                    "previous_measurement_id": baseline["id"],
+                    "measurement_id": m["id"],
+                    "delta": delta,
+                    "abs_delta": abs(delta),
+                })
+        # 证书切换（certificate_id 不同）不比较，当前测量直接成为新基线
+        baseline = m
+    return comparisons, drifts
+
+
 def serialize_measurement(
     meas: dict[str, Any],
     revision: int,
